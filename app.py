@@ -322,6 +322,10 @@ def main():
     else:
         df = st.session_state["working_df"]
 
+        # 统一列名（兼容示例数据和上传文件）
+        if "客诉文本" not in df.columns and "complaint_text" in df.columns:
+            df["客诉文本"] = df["complaint_text"]
+
         # 执行分析
         with st.spinner("正在分析客诉数据..."):
             df = analyze_dataframe(df, use_llm=use_llm, api_key=api_key)
