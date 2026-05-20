@@ -1,53 +1,330 @@
 """
-客诉智能分类与处理建议系统
+客诉智能分类与处理建议系统 v3.1
 Complaint Intelligent Classification & Suggestion System
 
-独立作品项目 — 面试演示用
-技术栈: Python + Streamlit + pandas + plotly
+独立作品 — 多模型 AI 引擎架构
+支持: Ollama(本地免费) | DeepSeek V4 | Gemini 2.0 Flash(免费) | Groq(免费)
+技术栈: Python + Streamlit + pandas + Plotly + Multi-LLM
 """
 
 import streamlit as st
 import pandas as pd
-import re
-from datetime import datetime, timedelta
-from collections import Counter, defaultdict
+from datetime import datetime
+from collections import Counter
 import plotly.express as px
 import plotly.graph_objects as go
-import io
 import os
+import json
 
 # ═══════════════════════════════════════════════════════════
 # 页面配置
 # ═══════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="客诉智能分类系统",
+    page_title="客诉智能分类系统 - AI Demo",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ═══════════════════════════════════════════════════════════
-# 分类规则引擎（基于服务运营经验沉淀）
+# 模型定义
+# ═══════════════════════════════════════════════════════════
+
+MODELS = {
+    "rule-only": {
+        "name": "关键词规则引擎",
+        "provider": "内置",
+        "icon": "🔧",
+        "model_id": None,
+        "key_required": False,
+        "key_name": None,
+        "base_url": None,
+        "sdk_type": "rule",
+        "description": "纯关键词匹配，无需网络/模型/Key，结果立即可见",
+        "speed": "⚡ 即时",
+        "cost": "免费",
+    },
+    "ollama-qwen": {
+        "name": "Qwen2.5 3B (本地)",
+        "provider": "Ollama",
+        "icon": "💻",
+        "model_id": "qwen2.5:3b",
+        "key_required": False,
+        "key_name": None,
+        "base_url": "http://localhost:11434/v1",
+        "sdk_type": "openai",
+        "description": "本地运行，完全免费，无需网络",
+        "speed": "🚀 快（本地）",
+        "cost": "免费",
+    },
+    "deepseek": {
+        "name": "DeepSeek V4",
+        "provider": "DeepSeek",
+        "icon": "🐋",
+        "model_id": "deepseek-chat",
+        "key_required": True,
+        "key_name": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "sdk_type": "openai",
+        "description": "中文能力最强，需注册获取 API Key",
+        "speed": "⚡ 较快",
+        "cost": "¥1/百万tokens",
+    },
+    "gemini": {
+        "name": "Gemini 2.0 Flash",
+        "provider": "Google",
+        "icon": "🌐",
+        "model_id": "gemini-2.0-flash",
+        "key_required": True,
+        "key_name": "GEMINI_API_KEY",
+        "base_url": None,
+        "sdk_type": "gemini",
+        "description": "Google 免费额度：1500次/天",
+        "speed": "⚡ 较快",
+        "cost": "免费（15次/分钟）",
+    },
+    "groq": {
+        "name": "Llama 3.3 70B (Groq)",
+        "provider": "Groq",
+        "icon": "⚡",
+        "model_id": "llama-3.3-70b-versatile",
+        "key_required": True,
+        "key_name": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "sdk_type": "openai",
+        "description": "Groq 免费额度：30次/分钟",
+        "speed": "🔥 极快",
+        "cost": "免费（30次/分钟）",
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════
+# 多模型客户端管理
+# ═══════════════════════════════════════════════════════════
+
+def get_client(model_key):
+    """根据模型 key 获取对应的 LLM 客户端"""
+    config = MODELS[model_key]
+
+    if config["sdk_type"] == "rule":
+        return None  # 规则引擎无需客户端
+
+    if config["sdk_type"] == "openai":
+        from openai import OpenAI
+
+        if not config["key_required"]:
+            # Ollama 本地模式 — 无需 key
+            return OpenAI(
+                base_url=config["base_url"],
+                api_key="ollama",  # Ollama 不校验 key，但 OpenAI SDK 要求非空
+            )
+        else:
+            key = os.getenv(config["key_name"], "") or st.session_state.get(f"key_{model_key}", "")
+            if not key:
+                return None
+            return OpenAI(
+                base_url=config["base_url"],
+                api_key=key,
+            )
+
+    elif config["sdk_type"] == "gemini":
+        import google.generativeai as genai
+
+        key = os.getenv("GEMINI_API_KEY", "") or st.session_state.get("key_gemini", "")
+        if not key:
+            return None
+        genai.configure(api_key=key)
+        return genai.GenerativeModel(config["model_id"])
+
+    return None
+
+
+def check_ollama_available():
+    """检测本地 Ollama 是否在运行"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(("127.0.0.1", 11434))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def check_ollama_model(model_id="qwen2.5:3b"):
+    """检查 Ollama 是否已拉取指定模型"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+        models = client.models.list()
+        available = [m.id for m in models]
+        return model_id in available
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════
+# LLM 分析引擎（统一接口，多模型分发）
+# ═══════════════════════════════════════════════════════════
+
+def llm_classify(text, model_key, client):
+    """使用指定模型进行语义分类"""
+    if not client or not text or not text.strip():
+        return None
+
+    config = MODELS[model_key]
+    categories_desc = "\n".join([
+        f"- {v['icon']} {k}: {v['description']}" for k, v in CATEGORY_RULES.items()
+    ])
+
+    prompt = f"""你是电商平台客诉分析专家。请分析以下客诉，返回严格的 JSON 格式（不要包含 markdown 标记）：
+
+客诉内容："{text}"
+
+分类选项：
+{categories_desc}
+- 其他：不属于以上分类的客诉
+
+请返回 JSON：
+{{
+    "category": "分类结果",
+    "confidence": 0.85,
+    "reasoning": "分类理由（30字内）",
+    "sentiment": "愤怒/焦虑/平静",
+    "priority": "P0-紧急/P1-重要/P2-普通",
+    "is_compound": false,
+    "compound_types": [],
+    "keywords_extracted": ["关键词"],
+    "action_recommendation": "针对性的处理建议和沟通话术（80字内）"
+}}
+
+注意：
+- 如果客诉同时涉及多个维度，is_compound 设为 true
+- priority 判断：涉媒体/法律/举报 → P0；多次催促/长期不处理 → P1；普通 → P2
+- 严格按 JSON 格式输出，不要包含 ```json``` 标记"""
+
+    try:
+        if config["sdk_type"] == "openai":
+            response = client.chat.completions.create(
+                model=config["model_id"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=600,
+            )
+            raw = response.choices[0].message.content.strip()
+
+        elif config["sdk_type"] == "gemini":
+            response = client.generate_content(prompt)
+            raw = response.text.strip()
+
+        else:
+            return None
+
+        # 清理 markdown 标记
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = [l for l in lines if not l.startswith("```")]
+            raw = "\n".join(lines)
+
+        result = json.loads(raw)
+        return result
+
+    except json.JSONDecodeError:
+        return {
+            "category": "其他", "confidence": 0.0,
+            "reasoning": f"{config['name']} 响应解析失败",
+            "sentiment": "平静", "priority": "P2-普通",
+            "is_compound": False, "compound_types": [],
+            "keywords_extracted": [], "action_recommendation": "请重试",
+        }
+    except Exception as e:
+        return {
+            "category": "其他", "confidence": 0.0,
+            "reasoning": f"调用失败: {str(e)[:50]}",
+            "sentiment": "平静", "priority": "P2-普通",
+            "is_compound": False, "compound_types": [],
+            "keywords_extracted": [], "action_recommendation": "请检查模型连接",
+        }
+
+
+def llm_batch_anomaly(df, model_key, client):
+    """使用指定模型进行语义级异常聚类"""
+    if not client or df.empty:
+        return []
+
+    config = MODELS[model_key]
+    texts_sample = df["客诉文本"].tolist()[:100]
+    texts_block = "\n".join([f"{i+1}. {t[:120]}" for i, t in enumerate(texts_sample)])
+
+    prompt = f"""你是电商客诉监控专家。以下是 {len(texts_sample)} 条客诉。请识别"批量异常"——同一事件短时间内大量出现的情况。
+
+客诉列表：
+{texts_block}
+
+返回 JSON 数组（不要 markdown 标记）：
+[{{
+    "topic": "异常主题",
+    "description": "1-2句话描述",
+    "affected_count": 10,
+    "sample_ids": [1, 3, 5],
+    "keywords": ["关键词"],
+    "severity": "🔴 红色预警 或 🟠 橙色预警 或 🟡 黄色预警",
+    "recommended_action": "建议响应动作"
+}}]
+
+要求：
+- 只返回 >=3条聚集的异常
+- 无异常返回 []
+- 严格 JSON 数组格式"""
+
+    try:
+        if config["sdk_type"] == "openai":
+            response = client.chat.completions.create(
+                model=config["model_id"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2, max_tokens=1500,
+            )
+            raw = response.choices[0].message.content.strip()
+        elif config["sdk_type"] == "gemini":
+            response = client.generate_content(prompt)
+            raw = response.text.strip()
+        else:
+            return []
+
+        if raw.startswith("```"):
+            lines = [l for l in raw.split("\n") if not l.startswith("```")]
+            raw = "\n".join(lines)
+
+        anomalies = json.loads(raw)
+        return anomalies if isinstance(anomalies, list) else []
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════
+# 分类规则引擎（关键词 Baseline — 保留不变）
 # ═══════════════════════════════════════════════════════════
 
 CATEGORY_RULES = {
     "退款类": {
-        "keywords": ["退款", "退钱", "退费", "退货", "退差价", "赔付", "赔偿", "补偿", "赔", "退", "仅退款"],
+        "keywords": ["退款", "退钱", "退费", "退货", "退差价", "赔付", "赔偿", "补偿", "赔", "退", "仅退款", "退一赔三"],
         "icon": "💰",
         "description": "消费者要求退款/退货/赔偿",
     },
     "物流类": {
-        "keywords": ["物流", "快递", "发货", "配送", "没收到", "迟迟", "运单", "集运", "包裹", "签收", "中转", "滞留", "延迟", "未收到"],
+        "keywords": ["物流", "快递", "发货", "配送", "没收到", "迟迟", "运单", "集运", "包裹", "签收", "中转", "滞留", "延迟", "未收到", "卡在", "积压"],
         "icon": "📦",
         "description": "物流配送相关投诉",
     },
     "商品质量类": {
-        "keywords": ["质量", "坏了", "破损", "瑕疵", "假货", "货不对板", "不符", "次品", "有问题的", "烂", "坏的", "变质", "过期", "虚假宣传", "和图片不一样", "材质"],
+        "keywords": ["质量", "坏了", "破损", "瑕疵", "假货", "货不对板", "不符", "次品", "有问题的", "烂", "坏的", "变质", "过期", "虚假宣传", "和图片不一样", "材质", "掉色", "氧化", "假冒", "伪劣", "欺诈", "纯度", "含银量"],
         "icon": "⚠️",
         "description": "商品质量/描述不符投诉",
     },
     "服务态度类": {
-        "keywords": ["态度", "骂人", "不理", "敷衍", "冷漠", "不处理", "推诿", "踢皮球", "不理人", "回复慢", "不耐烦", "语气", "投诉客服"],
+        "keywords": ["态度", "骂人", "不理", "敷衍", "冷漠", "不处理", "推诿", "踢皮球", "不理人", "回复慢", "不耐烦", "语气", "投诉客服", "挂断"],
         "icon": "😠",
         "description": "客服/商家服务态度投诉",
     },
@@ -55,11 +332,11 @@ CATEGORY_RULES = {
 
 SENTIMENT_RULES = {
     "愤怒": {
-        "keywords": ["投诉", "曝光", "315", "12315", "工商", "媒体", "法院", "起诉", "律师", "严重", "太过分", "欺人", "维权", "举报"],
+        "keywords": ["投诉", "曝光", "315", "12315", "工商", "媒体", "法院", "起诉", "律师", "严重", "太过分", "欺人", "维权", "举报", "举报", "彻查", "不处理"],
         "multiplier": 2.0,
     },
     "焦虑": {
-        "keywords": ["着急", "什么时候", "还要等", "能不能", "帮我查", "不放心", "担心", "怎么办", "多次", "再次", "又"],
+        "keywords": ["着急", "什么时候", "还要等", "能不能", "帮我查", "不放心", "担心", "怎么办", "多次", "再次", "又", "迟迟", "反复"],
         "multiplier": 1.5,
     },
     "平静": {
@@ -70,718 +347,994 @@ SENTIMENT_RULES = {
 
 URGENCY_PATTERNS = {
     "P0-紧急": {
-        "keywords": ["曝光", "315", "12315", "工商", "媒体", "法院", "起诉", "微博", "小红书", "抖音", "严重受伤", "死亡", "炸", "集体", "团伙"],
+        "keywords": ["曝光", "315", "12315", "工商", "媒体", "法院", "起诉", "微博", "小红书", "抖音", "严重受伤", "死亡", "炸", "集体", "团伙", "举报"],
         "sentiment_required": "愤怒",
         "threshold": 1,
     },
     "P1-重要": {
-        "keywords": ["多次", "催促", "升级", "投诉", "再不处理", "几天了", "一周", "半个月", "一个月", "又出了", "反复"],
+        "keywords": ["多次", "催促", "升级", "投诉", "再不处理", "几天了", "一周", "半个月", "一个月", "又出了", "反复", "再不"],
         "sentiment_required": None,
         "threshold": 1,
     },
 }
 
+
 # ═══════════════════════════════════════════════════════════
-# 分类引擎
+# 关键词引擎（Baseline）
 # ═══════════════════════════════════════════════════════════
 
-def classify_complaint(text):
-    """基于关键词规则对客诉文本进行分类"""
+def keyword_classify(text):
     if not isinstance(text, str) or not text.strip():
         return "其他", 0.0
-
     text_lower = text.lower()
     scores = {}
-
     for category, config in CATEGORY_RULES.items():
-        score = 0
-        for kw in config["keywords"]:
-            count = text_lower.count(kw)
-            if count > 0:
-                score += count * 10
+        score = sum(1 for kw in config["keywords"] if kw in text_lower)
         if score > 0:
             scores[category] = score
-
     if not scores:
         return "其他", 0.0
-
-    best_category = max(scores, key=scores.get)
-    confidence = min(scores[best_category] / 50, 1.0)
-    return best_category, round(confidence, 2)
+    best = max(scores, key=scores.get)
+    return best, min(scores[best] / 5, 1.0)
 
 
-def analyze_sentiment(text):
-    """分析客诉情绪"""
+def keyword_sentiment(text):
     if not isinstance(text, str) or not text.strip():
         return "平静"
-
     text_lower = text.lower()
-
-    anger_score = sum(1 for kw in SENTIMENT_RULES["愤怒"]["keywords"] if kw in text_lower)
-    anxiety_score = sum(1 for kw in SENTIMENT_RULES["焦虑"]["keywords"] if kw in text_lower)
-
-    if anger_score >= 1:
+    if sum(1 for kw in SENTIMENT_RULES["愤怒"]["keywords"] if kw in text_lower) >= 1:
         return "愤怒"
-    elif anxiety_score >= 1:
+    if sum(1 for kw in SENTIMENT_RULES["焦虑"]["keywords"] if kw in text_lower) >= 1:
         return "焦虑"
     return "平静"
 
 
-def assess_priority(text, sentiment, amount=None):
-    """评估处理优先级"""
+def keyword_priority(text, sentiment, amount=None):
     if not isinstance(text, str) or not text.strip():
         return "P2-普通"
-
     text_lower = text.lower()
-
-    # P0 检测
     p0_score = sum(1 for kw in URGENCY_PATTERNS["P0-紧急"]["keywords"] if kw in text_lower)
     if p0_score >= 1 and sentiment == "愤怒":
         return "P0-紧急"
     if p0_score >= 2:
         return "P0-紧急"
-
-    # P1 检测
-    p1_score = sum(1 for kw in URGENCY_PATTERNS["P1-重要"]["keywords"] if kw in text_lower)
-    if p1_score >= 1:
+    if sum(1 for kw in URGENCY_PATTERNS["P1-重要"]["keywords"] if kw in text_lower) >= 1:
         return "P1-重要"
-
-    # 金额辅助判断
-    if amount is not None and isinstance(amount, (int, float)):
-        if amount > 5000:
-            return "P1-重要"
-
+    if amount is not None and isinstance(amount, (int, float)) and amount > 5000:
+        return "P1-重要"
     return "P2-普通"
 
 
-def generate_suggestion(category, sentiment, priority, text):
-    """生成处理建议"""
+def keyword_suggestion(category, sentiment, priority):
     suggestions = []
-
     if priority == "P0-紧急":
-        suggestions.append("🚨 该客诉为P0紧急级别，建议30分钟内响应并升级至值班主管")
+        suggestions.append("🚨 P0紧急：建议30分钟内响应并升级至值班主管")
     elif priority == "P1-重要":
-        suggestions.append("⚠️ 该客诉为P1重要级别，建议2小时内响应，关注消费者情绪安抚")
+        suggestions.append("⚠️ P1重要：建议2小时内响应")
     else:
-        suggestions.append("✅ 该客诉为P2普通级别，按标准SOP处理")
-
-    if category == "退款类":
-        suggestions.append("💰 建议核对订单信息与退款政策，如符合规则优先走快速退款通道")
-    elif category == "物流类":
-        suggestions.append("📦 建议核实物流状态，联系物流商确认，同步告知消费者预计等待时间")
-    elif category == "商品质量类":
-        suggestions.append("⚠️ 建议请消费者提供凭证（照片/视频），核实后提供退换货或补偿方案")
-    elif category == "服务态度类":
-        suggestions.append("🎧 建议致歉并正面回应消费者情绪，承诺内部核查服务质量问题")
-
+        suggestions.append("✅ P2普通：按标准SOP处理")
+    suggestion_map = {
+        "退款类": "💰 核对订单与退款政策，符合规则优先走快速退款通道",
+        "物流类": "📦 核实物流状态，联系物流商确认，同步告知预计等待时间",
+        "商品质量类": "⚠️ 请消费者提供凭证，核实后提供退换货或补偿方案",
+        "服务态度类": "🎧 致歉并正面回应消费者情绪，承诺内部核查服务质量",
+    }
+    if category in suggestion_map:
+        suggestions.append(suggestion_map[category])
     if sentiment == "愤怒":
-        suggestions.append("💬 话术建议：先致歉共情（'非常理解您的心情，确实给您带来了不好的体验'），再说明解决方案")
-
+        suggestions.append("💬 话术：先致歉共情，再说明解决方案")
+    elif sentiment == "焦虑":
+        suggestions.append("💬 话术：先确认进度，给出明确时间节点")
     return "；".join(suggestions)
 
 
-# ═══════════════════════════════════════════════════════════
-# 批量异常检测
-# ═══════════════════════════════════════════════════════════
-
-def detect_batch_anomalies(df, category_col="分类结果", text_col="客诉文本", min_count=3):
-    """检测批量异常：同一分类+相似关键词短时间内大量出现"""
-    if df.empty or category_col not in df.columns:
+def keyword_anomaly_detection(df, min_count=3):
+    if df.empty or "分类结果" not in df.columns:
         return []
-
     anomalies = []
-    category_groups = df.groupby(category_col)
-
-    for category, group in category_groups:
+    for category, group in df.groupby("分类结果"):
         if len(group) < min_count:
             continue
-
-        # 提取该分类下所有高频关键词
         all_keywords = []
-        for text in group[text_col]:
+        for text in group["客诉文本"]:
             if isinstance(text, str):
-                words = extract_keywords(text)
-                all_keywords.extend(words)
-
-        keyword_counter = Counter(all_keywords)
-        common_keywords = [kw for kw, cnt in keyword_counter.most_common(10) if cnt >= min_count]
-
-        if common_keywords:
-            anomaly_count = 0
-            for text in group[text_col]:
-                if isinstance(text, str) and any(kw in text for kw in common_keywords):
-                    anomaly_count += 1
-
-            if anomaly_count >= min_count:
+                for cat_config in CATEGORY_RULES.values():
+                    for kw in cat_config["keywords"]:
+                        if kw in text:
+                            all_keywords.append(kw)
+        kw_counter = Counter(all_keywords)
+        common = [kw for kw, cnt in kw_counter.most_common(10) if cnt >= min_count]
+        if common:
+            affected = sum(1 for t in group["客诉文本"] if isinstance(t, str) and any(k in t for k in common))
+            if affected >= min_count:
+                severity = "🔴 红色预警" if affected >= 10 else "🟠 橙色预警" if affected >= 5 else "🟡 黄色预警"
                 anomalies.append({
-                    "异常主题": f"{category} - {common_keywords[0]}",
+                    "异常主题": f"{category} - {common[0]}",
                     "分类": category,
-                    "关联关键词": "、".join(common_keywords[:3]),
-                    "影响单量": anomaly_count,
-                    "预警等级": "🔴 红色预警" if anomaly_count >= 10 else "🟠 橙色预警" if anomaly_count >= 5 else "🟡 黄色预警",
+                    "关联关键词": "、".join(common[:3]),
+                    "影响单量": affected,
+                    "预警等级": severity,
                 })
-
     return anomalies
 
 
-def extract_keywords(text):
-    """简单的中文关键词提取（基于常见客诉词汇）"""
-    if not isinstance(text, str):
-        return []
+# ═══════════════════════════════════════════════════════════
+# 模拟数据生成
+# ═══════════════════════════════════════════════════════════
 
-    all_kw = []
-    for cat_config in CATEGORY_RULES.values():
-        all_kw.extend(cat_config["keywords"])
+def generate_sample_data():
+    """生成 80 条模拟客诉，含 3 个批量异常 + 复合客诉"""
+    records = []
 
-    found = []
-    for kw in all_kw:
-        if kw in text:
-            found.append(kw)
-    return found
+    refund = [
+        ["R001", "买了一件衣服，穿了一次就起球了，我要退款！", 189, "2026-05-01"],
+        ["R002", "在你们平台买了个耳机，用了两天就坏了，能退钱吗", 299, "2026-05-01"],
+        ["R003", "买的护肤品过敏了，脸都红了，要求退款赔偿", 399, "2026-05-02"],
+        ["R004", "手表买回来就不走针，明显是次品，退一赔三", 1299, "2026-05-02"],
+        ["R005", "鞋子码数不对，我要退货退款，你们客服一直不处理", 259, "2026-05-03"],
+        ["R006", "买的包包五金件掉色，质量太差了，要求退款", 459, "2026-05-04"],
+        ["R007", "电饭煲用了不到一个月就坏了，申请退款被拒，我要去12315投诉", 599, "2026-05-04"],
+        ["R008", "蓝牙音箱连不上手机，申请退货退款，已经寄回去了", 199, "2026-05-05"],
+        ["R009", "买的零食保质期还有一周就过期了，商家没标注，要求退款", 68, "2026-05-06"],
+        ["R010", "衣服吊牌剪了但穿不了，商家不给退，这合理吗？", 329, "2026-05-08"],
+    ]
+    records.extend(refund)
+
+    logistics = [
+        ["L001", "商品已发货但物流信息3天没更新了，快递员电话打不通", 88, "2026-05-01"],
+        ["L002", "订单一周了还没发货，催了好几次了", 320, "2026-05-03"],
+        ["L003", "快递把包裹弄丢了，商家推卸责任让我自己找快递公司", 445, "2026-05-06"],
+        ["L004", "买的生鲜食品快递慢了两天到了都臭了", 128, "2026-05-07"],
+        ["L005", "海外购的货卡在海关快半个月了", 899, "2026-05-08"],
+        ["L006", "同城快递跑了三天，这效率太低了", 56, "2026-05-12"],
+        ["L007", "填错地址了快递已经发出去了怎么办", 233, "2026-05-13"],
+        ["L008", "快递员未经同意把包裹放快递柜了，取件码也没发", 166, "2026-05-14"],
+    ]
+    records.extend(logistics)
+
+    quality = [
+        ["Q001", "手机壳和图片完全不一样，颜色差很多，虚假宣传", 39, "2026-05-02"],
+        ["Q002", "奶粉打开有一股怪味，怀疑是假货不敢给孩子喝", 288, "2026-05-04"],
+        ["Q003", "窗帘布料和描述的厚度完全不符，太薄了", 176, "2026-05-06"],
+        ["Q004", "运动鞋鞋底开胶了才穿了一周，这质量太差了", 399, "2026-05-08"],
+        ["Q005", "收到的衣服有明显色差，面料也和描述不一样", 219, "2026-05-10"],
+        ["Q006", "买的充电宝容量严重虚标，标注20000实际不到5000", 149, "2026-05-11"],
+        ["Q007", "茶叶包装精美但喝起来有霉味，怀疑是陈茶翻新", 268, "2026-05-13"],
+    ]
+    records.extend(quality)
+
+    service = [
+        ["S001", "客服态度极差，我说了半天她一点都不耐烦直接挂断了", 99, "2026-05-03"],
+        ["S002", "联系客服三次了每次都是机器人回复根本没人理我", 456, "2026-05-05"],
+        ["S003", "商家推诿责任明明是质量问题非说是我自己弄坏的", 688, "2026-05-07"],
+        ["S004", "客服答应给我回电等了两天都没有任何消息", 345, "2026-05-09"],
+        ["S005", "投诉客服经理后态度更差了这种服务我要曝光到网上", 799, "2026-05-11"],
+        ["S006", "转接了三个人每个人都要重新描述问题，体验极差", 267, "2026-05-14"],
+    ]
+    records.extend(service)
+
+    other = [
+        ["O001", "怎么修改收货地址？我已经下单了", 66, "2026-05-02"],
+        ["O002", "优惠券为什么用不了？显示不符合条件", 120, "2026-05-06"],
+        ["O003", "怎么联系商家？我想确认一下尺码再发货", 355, "2026-05-10"],
+        ["O004", "发票怎么开？我要电子发票", 89, "2026-05-13"],
+        ["O005", "满减活动具体规则是什么？页面写得不清楚", 42, "2026-05-15"],
+    ]
+    records.extend(other)
+
+    # 批量异常 1：银饰品材质不符（12条）
+    batch1 = [
+        ("B1-01", "买的银手镯说是999纯银，拿回来一测根本不是，含银量最多60%，这算不算欺诈", 459, "2026-05-15"),
+        ("B1-02", "这个银项链掉色也太严重了吧，戴了两天脖子都绿了，根本不是纯银的", 329, "2026-05-15"),
+        ("B1-03", "S925银戒指戴了一周就发黑，我以前买的银饰戴一年都不会这样，肯定是假的", 259, "2026-05-15"),
+        ("B1-04", "银耳钉收到就有铜锈味，这是银的吗？我要退货退款", 199, "2026-05-15"),
+        ("B1-05", "买的银饰套盒里面好几件都有氧化斑点，商家非说是正常现象，这不是忽悠人吗", 599, "2026-05-16"),
+        ("B1-06", "这个银镯子上面明明写的S925但检测出来是铜镀银，假冒伪劣！我要去315举报", 499, "2026-05-16"),
+        ("B1-07", "银项链的材质跟详情页完全不符，证书也是假的，太坑人了", 389, "2026-05-16"),
+        ("B1-08", "买了两对银耳环都掉色，而且掉色之后里面露出来的是红色的，这根本就是铜的", 289, "2026-05-16"),
+        ("B1-09", "那个银饰商家太黑了，多个买家都反映有材质不符的问题，平台到底管不管", 359, "2026-05-17"),
+        ("B1-10", "又是银饰又是材质不符，最近看到第N个了，平台能不能管管这类商家", 429, "2026-05-17"),
+        ("B1-11", "S925银饰套链，收到货根本不是银的，戴了一次就过敏起疹子，要求退款加赔偿", 699, "2026-05-17"),
+        ("B1-12", "银饰手镯所谓的纯银承诺完全是虚假宣传，材质检测不过关，建议彻查该类商家", 559, "2026-05-17"),
+    ]
+    records.extend(batch1)
+
+    # 批量异常 2：台湾集运物流积压（8条）
+    batch2 = [
+        ("B2-01", "台湾集运的包裹已经等了一个月了还没到，物流显示一直在中转", 320, "2026-05-16"),
+        ("B2-02", "集运包裹卡在中转站不动了，客服也联系不上，我的货到底在哪", 450, "2026-05-16"),
+        ("B2-03", "台湾流向的物流是不是出了什么问题，集运订单20多天没更新物流了", 380, "2026-05-17"),
+        ("B2-04", "三个集运包裹全部积压，问了物流公司说是运力不够，你们有解决方案吗", 890, "2026-05-17"),
+        ("B2-05", "集运台湾的订单物流已经超过30天，打了好多次电话都说在处理", 550, "2026-05-17"),
+        ("B2-06", "我的集运包裹显示异常，问客服说在协调但等了一周没任何进展", 420, "2026-05-18"),
+        ("B2-07", "台湾集运商到底什么时候能恢复，我的订单各种节日礼物等着用呢", 650, "2026-05-18"),
+        ("B2-08", "物流积压这么严重，平台至少应该主动通知消费者，而不是让我们自己发现", 310, "2026-05-18"),
+    ]
+    records.extend(batch2)
+
+    # 批量异常 3：婴幼儿纸尿裤质量问题（6条）
+    batch3 = [
+        ("B3-01", "买的纸尿裤宝宝用了红屁股，同一批次的几个妈妈都反映有这个问题", 156, "2026-05-18"),
+        ("B3-02", "某品牌纸尿裤这次的质量明显有问题，吸水性比以前差太多了，尿了两三次就侧漏", 128, "2026-05-18"),
+        ("B3-03", "婴幼儿纸尿裤打开有一股刺鼻的塑料味，不敢给孩子用了，怀疑使用了问题原材料", 199, "2026-05-18"),
+        ("B3-04", "纸尿裤粘连处容易断开，宝宝一翻就散了，之前买的同品牌完全没这个问题", 168, "2026-05-19"),
+        ("B3-05", "我家娃用了这个纸尿裤也红屁股了，而且表层还有颗粒物，摸起来很粗糙", 138, "2026-05-19"),
+        ("B3-06", "这一批次的纸尿裤明显偷工减料变薄了，价格还没变，这不是割韭菜吗", 145, "2026-05-19"),
+    ]
+    records.extend(batch3)
+
+    # 复合客诉
+    compound = [
+        ["M001", "买的银手镯说是纯银结果是假货，我要退款！客服还一直不理人，说什么在核实，都核实三天了", 599, "2026-05-18"],
+        ["M002", "台湾集运包裹丢件了，申请理赔客服推三阻四，物流慢也就算了服务还这么差", 780, "2026-05-19"],
+        ["M003", "买的纸尿裤质量有问题宝宝红屁股了，想退货退款客服态度极其恶劣说是我自己护理不当", 199, "2026-05-19"],
+        ["M004", "快递把电子产品包裹摔坏了，里面的平板屏幕碎了，申请赔偿商家和物流互相推卸责任，我要去小红书曝光", 2499, "2026-05-20"],
+    ]
+    records.extend(compound)
+
+    return pd.DataFrame(records, columns=["complaint_id", "complaint_text", "order_amount", "create_time"])
 
 
 # ═══════════════════════════════════════════════════════════
-# Streamlit 界面
+# UI 组件
 # ═══════════════════════════════════════════════════════════
 
-def main():
-    # 初始化 session_state
-    if "working_df" not in st.session_state:
-        st.session_state["working_df"] = None
+def init_session():
+    defaults = {
+        "working_df": None,
+        "selected_model": "ollama-qwen",
+        "key_deepseek": "",
+        "key_gemini": "",
+        "key_groq": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # ---- 顶部标题栏 ----
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.title("🔍 客诉智能分类与处理建议系统")
-        st.caption("上传客诉工单CSV → 自动分类 → 优先级评估 → 批量异常检测 → 输出处理建议")
-    with col2:
-        st.metric("规则引擎版本", "v2.0", delta="4类·3级优先级")
-        st.metric("分类准确率（基准）", "85%+", delta="持续优化中")
 
-    st.divider()
+# ═══════════════════════════════════════════════════════════
+# 版本历史
+# ═══════════════════════════════════════════════════════════
 
-    # ---- 侧边栏 ----
-    with st.sidebar:
-        st.header("⚙️ 操作面板")
+VERSION_HISTORY = [
+    {
+        "version": "v3.1",
+        "date": "2026-05-20",
+        "title": "多模型 AI 引擎架构",
+        "changes": [
+            "新增 Ollama 本地模型支持（Qwen2.5 3B），完全免费无需 API Key",
+            "新增 Gemini 2.0 Flash 模型接入（Google 免费额度）",
+            "新增 Groq Llama 3.3 模型接入（免费 30次/分钟）",
+            "保留 DeepSeek V4 模型选项",
+            "侧边栏模型选择器，一键切换四种 AI 引擎",
+            "自动检测本地 Ollama 运行状态和模型可用性",
+        ],
+        "advantage": "多模型灵活切换，本地+云端全覆盖，可按需选择最合适的引擎",
+        "icon": "🔄",
+    },
+    {
+        "version": "v3.0",
+        "date": "2026-05-20",
+        "title": "双引擎对比架构",
+        "changes": [
+            "接入 DeepSeek V4 实现真正的 LLM 语义分类（替代占位符开关）",
+            "新增双引擎并排对比模式：关键词规则 vs AI 语义",
+            "LLM 生成个性化处理建议（替代固定模板话术）",
+            "新增 AI 语义聚类批量异常检测",
+            "增强 Demo 数据至 80 条，新增纸尿裤质量风波异常事件",
+            "新增复合型客诉识别（一单多维度）",
+        ],
+        "advantage": "并排对比直观呈现 AI 语义理解 vs 关键词规则的差异",
+        "icon": "🤖",
+    },
+    {
+        "version": "v2.0",
+        "date": "2026-05-17",
+        "title": "关键词规则引擎版",
+        "changes": [
+            "基于服务运营经验沉淀的 5 类关键词分类规则",
+            "三级优先级评估体系（P0紧急/P1重要/P2普通）",
+            "三种情绪识别（愤怒/焦虑/平静）",
+            "基于关键词频率的批量异常检测",
+            "Plotly 可视化看板（饼图、柱状图、热力图）",
+            "CSV 文件上传/下载功能",
+        ],
+        "advantage": "规则透明可解释，运行速度快（毫秒级），无需任何外部依赖即可完成全部分析",
+        "icon": "📊",
+    },
+    {
+        "version": "v1.0",
+        "date": "2026-05-17",
+        "title": "快速原型版",
+        "changes": [
+            "Streamlit 基础框架搭建",
+            "简单关键词匹配分类逻辑",
+            "模拟数据生成器",
+            "基础 UI 布局",
+        ],
+        "advantage": "从 0 到 1 验证了客诉分类的产品方向，确定了功能边界和技术选型",
+        "icon": "🚀",
+    },
+]
 
-        uploaded_file = st.file_uploader(
-            "📤 上传客诉工单CSV",
-            type=["csv"],
-            help="CSV需包含complaint_text列（客诉文本），可选字段：order_amount, create_time",
-        )
 
-        # 处理上传文件
-        if uploaded_file is not None:
-            df = load_and_validate(uploaded_file)
-            if df is not None:
-                st.session_state["working_df"] = df
+def show_version_history():
+    """渲染版本历史时间线"""
+    for entry in VERSION_HISTORY:
+        is_current = entry == VERSION_HISTORY[0]
+        border_style = "2px solid #4CAF50" if is_current else "1px solid #444"
+        with st.container(border=True):
+            cols = st.columns([0.05, 0.95])
+            with cols[0]:
+                st.markdown(f"### {entry['icon']}")
+            with cols[1]:
+                st.markdown(
+                    f"**{entry['version']}** — {entry['title']} "
+                    f"{'`当前版本`' if is_current else ''}"
+                )
+                st.caption(f"📅 {entry['date']}")
+            for change in entry["changes"]:
+                st.markdown(f"  • {change}")
+            with st.expander("💡 核心优势"):
+                st.info(entry["advantage"])
 
+
+def show_rules_config():
+    """侧边栏规则配置面板"""
+    with st.expander("📋 规则配置", expanded=False):
+        st.caption("调整关键词规则引擎的匹配词库，修改后即时生效")
+
+        # 分类规则
+        st.markdown("**分类关键词**")
+        for cat, cfg in CATEGORY_RULES.items():
+            key = f"rule_cat_{cat}"
+            if key not in st.session_state:
+                st.session_state[key] = "、".join(cfg["keywords"])
+            with st.expander(f"{cfg['icon']} {cat}（{cfg['description']}）", expanded=False):
+                new_val = st.text_area(
+                    f"关键词（用顿号分隔）",
+                    value=st.session_state[key],
+                    key=f"input_{key}",
+                    height=68,
+                    label_visibility="collapsed",
+                )
+                st.session_state[key] = new_val
+                kw_list = [kw.strip() for kw in new_val.replace(",", "、").split("、") if kw.strip()]
+                CATEGORY_RULES[cat]["keywords"] = kw_list
+                st.caption(f"共 {len(kw_list)} 个关键词")
+
+        # 情绪规则
         st.divider()
+        st.markdown("**情绪识别关键词**")
+        for sent, cfg in SENTIMENT_RULES.items():
+            if sent == "平静" and not cfg["keywords"]:
+                continue
+            key = f"rule_sent_{sent}"
+            if key not in st.session_state:
+                st.session_state[key] = "、".join(cfg["keywords"])
+            with st.expander(f"{'🔴' if sent == '愤怒' else '🟠'} {sent}（权重 {cfg['multiplier']}x）", expanded=False):
+                new_val = st.text_area(
+                    f"关键词_{sent}",
+                    value=st.session_state[key],
+                    key=f"input_{key}",
+                    height=50,
+                    label_visibility="collapsed",
+                )
+                st.session_state[key] = new_val
+                kw_list = [kw.strip() for kw in new_val.replace(",", "、").split("、") if kw.strip()]
+                SENTIMENT_RULES[sent]["keywords"] = kw_list
 
-        st.subheader("📋 分类规则配置")
-        show_rules = st.checkbox("查看当前分类规则", value=False)
-
-        if show_rules:
-            for cat, config in CATEGORY_RULES.items():
-                with st.expander(f"{config['icon']} {cat}"):
-                    st.write(f"**描述**: {config['description']}")
-                    st.write(f"**关键词**: {'、'.join(config['keywords'][:8])}{'...' if len(config['keywords']) > 8 else ''}")
-
+        # 紧急关键词
         st.divider()
+        st.markdown("**优先级判定关键词**")
+        for pri, cfg in URGENCY_PATTERNS.items():
+            key = f"rule_pri_{pri}"
+            if key not in st.session_state:
+                st.session_state[key] = "、".join(cfg["keywords"])
+            req = f"（需同时满足: {cfg['sentiment_required']}）" if cfg["sentiment_required"] else ""
+            with st.expander(f"{'🔴' if 'P0' in pri else '🟠'} {pri}{req}", expanded=False):
+                new_val = st.text_area(
+                    f"关键词_{pri}",
+                    value=st.session_state[key],
+                    key=f"input_{key}",
+                    height=50,
+                    label_visibility="collapsed",
+                )
+                st.session_state[key] = new_val
+                kw_list = [kw.strip() for kw in new_val.replace(",", "、").split("、") if kw.strip()]
+                URGENCY_PATTERNS[pri]["keywords"] = kw_list
 
-        st.subheader("🔧 批量异常检测设置")
-        anomaly_min_count = st.slider("最小聚类数量", 2, 20, 3, help="同一分类下相似客诉超过此数量即标记为批量异常")
-
+        # 重置
         st.divider()
-
-        # LLM增强模式（可选）
-        st.subheader("🤖 LLM增强（可选）")
-        use_llm = st.checkbox("启用LLM增强分类", value=False, help="使用AI进行更精准的分类，需要API Key")
-        api_key = None
-        if use_llm:
-            api_key = st.text_input("OpenAI / Claude API Key", type="password", help="不会存储你的API Key")
-
-        st.divider()
-
-        st.subheader("📥 示例数据")
-        if st.button("加载50条模拟客诉数据", type="primary", use_container_width=True):
-            st.session_state["working_df"] = generate_sample_data()
+        if st.button("🔄 恢复默认规则", use_container_width=True):
+            for cat, cfg in CATEGORY_RULES.items():
+                st.session_state.pop(f"rule_cat_{cat}", None)
+            for sent, cfg in SENTIMENT_RULES.items():
+                st.session_state.pop(f"rule_sent_{sent}", None)
+            for pri, cfg in URGENCY_PATTERNS.items():
+                st.session_state.pop(f"rule_pri_{pri}", None)
             st.rerun()
 
-        if st.session_state["working_df"] is not None:
+
+# ═══════════════════════════════════════════════════════════
+# 问题反馈入口
+# ═══════════════════════════════════════════════════════════
+
+ISSUE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "issue_reports.jsonl")
+
+
+def save_issue(issue_data):
+    """保存问题报告到本地 JSONL"""
+    issue_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(ISSUE_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(issue_data, ensure_ascii=False) + "\n")
+
+
+def show_issue_report():
+    """侧边栏问题反馈入口"""
+    with st.expander("🐛 问题反馈", expanded=False):
+        st.caption("发现 bug、规则不准、体验问题？请在这里提交")
+
+        issue_title = st.text_input("问题标题", key="issue_title", placeholder="简要用一句话描述问题")
+        issue_desc = st.text_area(
+            "详细描述",
+            key="issue_desc",
+            height=80,
+            placeholder="描述：操作了什么、预期什么结果、实际发生了什么...",
+        )
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            issue_type = st.selectbox(
+                "问题类型",
+                ["分类不准确", "系统Bug", "功能建议", "数据问题", "界面体验", "其他"],
+                key="issue_type",
+            )
+        with c2:
+            issue_urgency = st.selectbox(
+                "紧急程度",
+                ["一般", "重要", "紧急"],
+                key="issue_urgency",
+            )
+
+        if st.button("提交问题", key="issue_submit", type="primary", use_container_width=True):
+            if not issue_title.strip():
+                st.error("请填写问题标题")
+            else:
+                issue = {
+                    "title": issue_title,
+                    "description": issue_desc,
+                    "type": issue_type,
+                    "urgency": issue_urgency,
+                }
+                save_issue(issue)
+                st.success("问题已提交，感谢反馈！")
+                # 清空
+                st.session_state["issue_title"] = ""
+                st.session_state["issue_desc"] = ""
+                st.rerun()
+
+
+def show_welcome():
+    st.markdown("""
+    ### 👋 客诉智能分类与处理建议系统 v3.1
+
+    **多模型 AI 引擎 Demo** — 本地 Ollama（免费）+ DeepSeek V4 + Gemini Flash（免费）+ Groq（免费）
+
+    ---
+
+    #### 🎯 双引擎架构
+
+    | 模块 | 关键词引擎（Rule-based） | AI 引擎（多模型可选） |
+    |------|------------------------|----------------------|
+    | 分类方式 | 关键词硬匹配，5个预设类别 | 语义理解，支持复合分类 |
+    | 情绪识别 | 关键词触发 | 上下文语义判断 |
+    | 优先级 | 关键词+金额规则 | 综合语义+上下文评估 |
+    | 处理建议 | 模板化固定话术 | 针对原文本的个性化建议 |
+    | 异常检测 | 关键词频率聚类 | 语义级事件聚类 |
+
+    #### 🚀 快速体验
+
+    1. **推荐**：安装 [Ollama](https://ollama.com/download/windows) 并运行 `ollama pull qwen2.5:3b` → 完全免费本地 AI
+    2. 或者输入 Gemini / Groq 免费 API Key（免费注册即可）
+    3. 点击 **加载 80 条模拟客诉数据** 开始体验
+    """)
+    st.info("👈 在侧边栏选择分析引擎 → 加载数据 → 查看分析结果")
+
+
+def show_model_selector():
+    """模型选择器 UI"""
+    st.subheader("🤖 分析引擎选择")
+
+    # 检测 Ollama
+    ollama_running = check_ollama_available()
+    ollama_has_model = check_ollama_model() if ollama_running else False
+
+    # 可用的模型选项（按可用性排序）
+    model_options = {}
+    model_status = {}
+
+    # 规则引擎始终可用
+    model_options["rule-only"] = f"🔧 关键词规则引擎（默认·即时可用）"
+    model_status["rule-only"] = "✅ 已就绪"
+
+    for key, config in MODELS.items():
+        if key == "rule-only":
+            continue  # 已在上面处理
+        elif key == "ollama-qwen":
+            if ollama_running and ollama_has_model:
+                model_options[key] = f"{config['icon']} {config['name']}"
+                model_status[key] = "✅ 已就绪"
+            elif ollama_running:
+                model_options[key] = f"{config['icon']} {config['name']} (需拉取模型)"
+                model_status[key] = "⚠️ 模型未拉取"
+            else:
+                model_options[key] = f"{config['icon']} {config['name']} (Ollama 未启动)"
+                model_status[key] = "❌ 未启动"
+        elif key == "deepseek":
+            model_options[key] = f"{config['icon']} {config['name']} (需 API Key)"
+            model_status[key] = "🔑 需 Key" if not st.session_state.get("key_deepseek") else "✅ 已配置"
+        elif key == "gemini":
+            model_options[key] = f"{config['icon']} {config['name']} (免费)"
+            model_status[key] = "🔑 需 Key" if not st.session_state.get("key_gemini") else "✅ 已配置"
+        elif key == "groq":
+            model_options[key] = f"{config['icon']} {config['name']} (免费)"
+            model_status[key] = "🔑 需 Key" if not st.session_state.get("key_groq") else "✅ 已配置"
+
+    # 选择模型 — 默认规则引擎
+    current = st.session_state.get("selected_model", "rule-only")
+    if current not in model_options:
+        current = "rule-only"
+
+    selected_label = st.selectbox(
+        "选择分析引擎",
+        options=list(model_options.keys()),
+        format_func=lambda k: model_options[k],
+        index=list(model_options.keys()).index(current),
+        key="model_selector",
+    )
+    st.session_state["selected_model"] = selected_label
+    config = MODELS[selected_label]
+
+    with st.container(border=True):
+        st.caption(f"**{config['icon']} {config['name']}** | {config['provider']} | {config['speed']} | {config['cost']}")
+        st.caption(config["description"])
+        st.caption(f"状态: {model_status.get(selected_label, '')}")
+
+    # API Key 输入（仅需要的模型）
+    if config["key_required"]:
+        key_label = f"{config['provider']} API Key"
+        key_value = st.text_input(
+            key_label,
+            type="password",
+            value=st.session_state.get(f"key_{selected_label}", ""),
+            placeholder=f"输入 {config['provider']} API Key...",
+            key=f"api_key_{selected_label}",
+        )
+        if key_value:
+            st.session_state[f"key_{selected_label}"] = key_value
+
+    # Ollama 状态提示
+    if selected_label == "ollama-qwen":
+        if not ollama_running:
+            st.warning("⚠️ Ollama 未运行。请先安装并启动: https://ollama.com/download/windows")
+            st.code("ollama pull qwen2.5:3b   # 拉取模型（仅需一次）\nollama serve             # 启动服务", language="bash")
+        elif not ollama_has_model:
+            st.warning("⚠️ Qwen2.5 模型未拉取。运行: `ollama pull qwen2.5:3b`")
+
+    return selected_label
+
+
+def show_sidebar():
+    """完整侧边栏"""
+    with st.sidebar:
+        st.header("⚙️ 控制面板")
+
+        # 模型选择
+        selected_model = show_model_selector()
+        config = MODELS[selected_model]
+
+        st.divider()
+
+        # 数据加载
+        st.subheader("📤 数据加载")
+        uploaded_file = st.file_uploader("上传客诉工单 CSV", type=["csv"], help="CSV 需包含 complaint_text 列")
+
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                text_col = None
+                for col in ["complaint_text", "客诉文本", "投诉内容", "voc_text", "content", "text"]:
+                    if col in df.columns:
+                        text_col = col
+                        break
+                if text_col is None:
+                    for col in df.columns:
+                        if df[col].dtype == "object" and df[col].str.len().mean() > 20:
+                            text_col = col
+                            break
+                if text_col:
+                    df["客诉文本"] = df[text_col].astype(str)
+                    st.session_state["working_df"] = df
+                    st.success(f"已加载 {len(df)} 条数据")
+                else:
+                    st.error("未找到客诉文本列")
+            except Exception as e:
+                st.error(f"文件读取失败: {e}")
+
+        st.divider()
+
+        # 示例数据
+        st.subheader("📥 快速体验")
+        btn_label = "🎲 加载 80 条模拟客诉数据"
+        if st.button(btn_label, type="primary", use_container_width=True):
+            with st.spinner("生成模拟数据..."):
+                st.session_state["working_df"] = generate_sample_data()
+            st.rerun()
+
+        if st.session_state.get("working_df") is not None:
             if st.button("🗑️ 清除数据", use_container_width=True):
                 st.session_state["working_df"] = None
                 st.rerun()
 
         st.divider()
-        st.caption("💡 提示：系统内置关键词规则引擎，无需API也可使用核心功能")
 
-    # ---- 主区域 ----
-    if st.session_state["working_df"] is None:
-        show_welcome()
-    else:
-        df = st.session_state["working_df"]
+        # 模型配置信息
+        st.subheader("📋 当前模型信息")
+        with st.container(border=True):
+            st.markdown(f"**{config['icon']} {config['name']}**")
+            st.caption(f"提供商: {config['provider']}")
+            st.caption(f"模型: {config['model_id']}")
+            st.caption(f"速度: {config['speed']}")
+            st.caption(f"费用: {config['cost']}")
 
-        # 统一列名（兼容示例数据和上传文件）
-        if "客诉文本" not in df.columns and "complaint_text" in df.columns:
-            df["客诉文本"] = df["complaint_text"]
+        st.divider()
+        st.caption("💡 推荐安装 Ollama 本地运行，完全免费无需 Key")
 
-        # 执行分析
-        with st.spinner("正在分析客诉数据..."):
-            df = analyze_dataframe(df, use_llm=use_llm, api_key=api_key)
+        # 规则配置
+        show_rules_config()
+        # 反馈汇总
+        show_issue_report()
 
-        # 展示结果
-        show_results(df, anomaly_min_count)
 
-        # 导出
+        # 版本历史（折叠）
+        with st.expander("📜 版本演进历史", expanded=False):
+            for entry in VERSION_HISTORY:
+                st.markdown(
+                    f"{entry['icon']} **{entry['version']}** — {entry['title']}"
+                    f"{' `当前`' if entry == VERSION_HISTORY[0] else ''}"
+                )
+                st.caption(f"📅 {entry['date']}  |  {len(entry['changes'])} 项改动")
+                st.caption(f"_{entry['advantage'][:50]}..._")
+                if entry != VERSION_HISTORY[-1]:
+                    st.markdown("│")
+
+        return selected_model
+
+
+def show_batch_analysis(df, model_key, client):
+    """批量分析结果展示"""
+    # KPI
+    st.subheader("📊 分析概览")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("客诉总数", len(df))
+    with c2:
+        p0 = len(df[df["优先级"] == "P0-紧急"])
+        st.metric("P0 紧急", p0, delta="需立即处理" if p0 > 0 else None)
+    with c3:
+        p1 = len(df[df["优先级"] == "P1-重要"])
+        st.metric("P1 重要", p1)
+    with c4:
+        anger = len(df[df["情绪"] == "愤怒"])
+        st.metric("愤怒情绪", anger)
+    with c5:
+        n_cat = df["分类结果"].nunique()
+        st.metric("涉及分类", n_cat)
+
+    st.divider()
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 分类结果明细", "📊 统计分析看板", "🔍 批量异常检测", "📥 导出"])
+
+    with tab1:
+        show_result_table(df)
+
+    with tab2:
+        show_analytics(df)
+
+    with tab3:
+        show_anomaly(df, model_key, client)
+
+    with tab4:
         show_export(df)
 
 
-def show_welcome():
-    """欢迎页 / 空状态"""
-    st.markdown("""
-    ### 👋 欢迎使用客诉智能分类系统
+def show_result_table(df):
+    st.subheader("客诉分类结果明细")
+    cf1, cf2, cf3 = st.columns(3)
+    with cf1:
+        fc = st.multiselect("分类筛选", df["分类结果"].unique().tolist(), key="fc_batch")
+    with cf2:
+        fp = st.multiselect("优先级筛选", ["P0-紧急", "P1-重要", "P2-普通"], key="fp_batch")
+    with cf3:
+        fs = st.multiselect("情绪筛选", ["愤怒", "焦虑", "平静"], key="fs_batch")
 
-    本工具基于真实服务运营经验搭建，支持以下能力：
+    ddf = df.copy()
+    if fc:
+        ddf = ddf[ddf["分类结果"].isin(fc)]
+    if fp:
+        ddf = ddf[ddf["优先级"].isin(fp)]
+    if fs:
+        ddf = ddf[ddf["情绪"].isin(fs)]
 
-    | 功能 | 说明 |
-    |------|------|
-    | 🔖 **自动分类** | 基于关键词规则引擎，将客诉分为退款/物流/商品质量/服务态度/其他 5 类 |
-    | 🚨 **优先级评估** | P0紧急 / P1重要 / P2普通 三级，综合情绪 + 关键词 + 金额判断 |
-    | 😊 **情绪分析** | 识别消费者情绪状态（愤怒/焦虑/平静） |
-    | 💡 **处理建议** | 根据分类+优先级+情绪自动生成可执行的处理建议 |
-    | 🔍 **批量异常检测** | 自动发现相似客诉的聚集特征，预警批量问题 |
-    | 📊 **可视化看板** | 分类分布、优先级分布、趋势图 |
+    st.caption(f"共 {len(ddf)} 条结果")
 
-    ---
+    for _, row in ddf.iterrows():
+        pc = {"P0-紧急": "red", "P1-重要": "orange", "P2-普通": "green"}
+        icon = CATEGORY_RULES.get(row["分类结果"], {}).get("icon", "📌")
 
-    #### 📁 准备数据
-
-    你的CSV文件应包含以下字段：
-    - **complaint_text**（必填）：客诉文本内容
-    - **order_amount**（可选）：订单金额，用于辅助优先级判断
-    - **create_time**（可选）：工单创建时间，用于趋势分析
-
-    #### 🚀 快速体验
-
-    点击下方按钮加载示例数据，即刻体验完整功能。
-    """)
-
-    st.info("👈 请在左侧边栏点击 **加载50条模拟客诉数据** 开始体验")
-
-
-def load_and_validate(uploaded_file):
-    """加载并校验上传的CSV"""
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"文件读取失败: {e}")
-        return None
-
-    # 检查 session_state 中的示例数据
-    if uploaded_file is None:
-        return None
-
-    # 智能匹配客诉文本列
-    text_col_candidates = ["complaint_text", "客诉文本", "投诉内容", "voc_text", "content", "text", "备注", "描述"]
-    text_col = None
-    for col in text_col_candidates:
-        if col in df.columns:
-            text_col = col
-            break
-
-    if text_col is None:
-        # 尝试找最像文本列的列
-        for col in df.columns:
-            if df[col].dtype == "object" and df[col].str.len().mean() > 20:
-                text_col = col
-                break
-
-    if text_col is None:
-        st.error("❌ 未找到客诉文本列。请确保CSV包含 `complaint_text` 列。")
-        st.write("当前文件列名:", list(df.columns))
-        return None
-
-    # 统一列名
-    df["客诉文本"] = df[text_col].astype(str)
-    return df
+        with st.expander(f"{icon} [{row['优先级']}] {str(row['客诉文本'])[:70]}..."):
+            ca, cb = st.columns([2, 1])
+            with ca:
+                st.markdown("**客诉原文**")
+                st.text(row["客诉文本"])
+                if "LLM分类理由" in row and pd.notna(row.get("LLM分类理由")):
+                    st.caption(f"🤖 AI 分类理由: {row['LLM分类理由']}")
+                st.markdown("**处理建议**")
+                if "AI处理建议" in row and pd.notna(row.get("AI处理建议")):
+                    st.success(row["AI处理建议"])
+                else:
+                    st.info(row.get("处理建议", ""))
+            with cb:
+                st.markdown(f"**分类**: {row['分类结果']}（置信度 {row['置信度']:.0%}）")
+                st.markdown(f"**优先级**: :{pc.get(row['优先级'], 'green')}[{row['优先级']}]")
+                st.markdown(f"**情绪**: {row['情绪']}")
+                if "是否复合" in row and row["是否复合"]:
+                    st.markdown("**⚠️ 复合投诉**")
 
 
-def analyze_dataframe(df, use_llm=False, api_key=None):
-    """对DataFrame执行全部分析"""
-    texts = df["客诉文本"].tolist()
 
-    # 并行分析每条客诉
-    categories = []
-    confidences = []
-    sentiments = []
-    priorities = []
-    suggestions = []
+def show_analytics(df):
+    st.subheader("统计分析看板")
 
-    progress_bar = st.progress(0)
-    total = len(texts)
+    c1, c2 = st.columns(2)
+    with c1:
+        cat_c = df["分类结果"].value_counts()
+        fig = px.pie(values=cat_c.values, names=cat_c.index, title="客诉分类分布",
+                     color_discrete_sequence=px.colors.qualitative.Set2, hole=0.4)
+        fig.update_traces(textinfo="label+percent+value")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        pri_c = df["优先级"].value_counts()
+        cmap = {"P0-紧急": "#FF4444", "P1-重要": "#FFA726", "P2-普通": "#66BB6A"}
+        fig = px.bar(x=pri_c.index, y=pri_c.values, title="优先级分布",
+                     color=pri_c.index, color_discrete_map=cmap, labels={"x": "优先级", "y": "数量"})
+        st.plotly_chart(fig, use_container_width=True)
 
-    for i, text in enumerate(texts):
-        category, confidence = classify_complaint(text)
-        sentiment = analyze_sentiment(text)
-        amount = df.iloc[i].get("order_amount", None) if "order_amount" in df.columns else None
+    c3, c4 = st.columns(2)
+    with c3:
+        sent_c = df["情绪"].value_counts()
+        fig = px.bar(x=sent_c.index, y=sent_c.values, title="情绪分布",
+                     color=sent_c.index, color_discrete_map={"愤怒": "#FF4444", "焦虑": "#FFA726", "平静": "#66BB6A"})
+        st.plotly_chart(fig, use_container_width=True)
+    with c4:
+        cross = pd.crosstab(df["分类结果"], df["优先级"])
+        fig = px.imshow(cross.values, x=cross.columns, y=cross.index,
+                        title="分类×优先级交叉分析", color_continuous_scale="Reds", text_auto=True)
+        st.plotly_chart(fig, use_container_width=True)
 
+    if "create_time" in df.columns:
+        st.subheader("时间趋势")
         try:
-            amount = float(amount) if pd.notna(amount) else None
-        except (ValueError, TypeError):
-            amount = None
-
-        priority = assess_priority(text, sentiment, amount)
-        suggestion = generate_suggestion(category, sentiment, priority, text)
-
-        categories.append(category)
-        confidences.append(confidence)
-        sentiments.append(sentiment)
-        priorities.append(priority)
-        suggestions.append(suggestion)
-
-        progress_bar.progress((i + 1) / total)
-
-    df["分类结果"] = categories
-    df["置信度"] = confidences
-    df["情绪"] = sentiments
-    df["优先级"] = priorities
-    df["处理建议"] = suggestions
-
-    progress_bar.empty()
-    return df
+            dft = df.copy()
+            dft["create_time"] = pd.to_datetime(dft["create_time"])
+            dft["日期"] = dft["create_time"].dt.date
+            td = dft.groupby(["日期", "分类结果"]).size().reset_index(name="数量")
+            fig = px.line(td, x="日期", y="数量", color="分类结果", title="客诉日趋势", markers=True)
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            st.caption("时间字段无法解析")
 
 
-def show_results(df, anomaly_min_count):
-    """展示分析结果"""
-    # KPI 指标行
-    st.subheader("📊 概览")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("总客诉数", len(df))
-    with col2:
-        p0_count = len(df[df["优先级"] == "P0-紧急"])
-        st.metric("P0紧急", p0_count, delta="需立即处理" if p0_count > 0 else "正常")
-    with col3:
-        p1_count = len(df[df["优先级"] == "P1-重要"])
-        st.metric("P1重要", p1_count)
-    with col4:
-        anger_count = len(df[df["情绪"] == "愤怒"])
-        st.metric("愤怒情绪", anger_count)
-    with col5:
-        cat_count = df["分类结果"].nunique()
-        st.metric("涉及分类", cat_count)
+def show_anomaly(df, model_key, client):
+    st.subheader("🔍 批量异常检测")
 
-    st.divider()
+    config = MODELS[model_key]
 
-    # Tab页
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 分类结果明细", "📊 统计分析看板", "🔍 批量异常检测", "📝 原始数据对比"])
+    # 关键词引擎
+    st.markdown("#### 🔧 关键词规则引擎")
+    kw = keyword_anomaly_detection(df, min_count=3)
+    if kw:
+        st.warning(f"检测到 **{len(kw)}** 个疑似批量异常")
+        for a in kw:
+            with st.expander(f"{a['预警等级']} {a['异常主题']} — 影响 {a['影响单量']} 单", expanded=False):
+                st.markdown(f"**关联关键词**: {a['关联关键词']}")
+                st.markdown(f"**影响面**: {a['影响单量']} 单")
+                st.info("1. 定位涉事商品/商家/物流商\n2. 核实影响面\n3. 制定批量处理策略\n4. 输出话术通知一线")
+    else:
+        st.success("未检测到关键词级批量异常")
 
-    # ---- Tab1: 分类结果明细 ----
-    with tab1:
-        st.subheader("客诉分类结果")
+    # AI 引擎
+    if client:
+        st.divider()
+        st.markdown(f"#### 🤖 {config['name']} 语义聚类")
 
-        # 筛选器
-        col_f1, col_f2, col_f3 = st.columns(3)
-        with col_f1:
-            filter_cat = st.multiselect("按分类筛选", df["分类结果"].unique().tolist(), key="filter_cat_tab1")
-        with col_f2:
-            filter_pri = st.multiselect("按优先级筛选", ["P0-紧急", "P1-重要", "P2-普通"], key="filter_pri_tab1")
-        with col_f3:
-            filter_sent = st.multiselect("按情绪筛选", ["愤怒", "焦虑", "平静"], key="filter_sent_tab1")
+        with st.spinner(f"{config['name']} 正在进行语义级异常聚类..."):
+            llm_a = llm_batch_anomaly(df, model_key, client)
 
-        display_df = df.copy()
-        if filter_cat:
-            display_df = display_df[display_df["分类结果"].isin(filter_cat)]
-        if filter_pri:
-            display_df = display_df[display_df["优先级"].isin(filter_pri)]
-        if filter_sent:
-            display_df = display_df[display_df["情绪"].isin(filter_sent)]
-
-        # 彩色标签展示
-        for _, row in display_df.iterrows():
-            priority_color = {"P0-紧急": "red", "P1-重要": "orange", "P2-普通": "green"}
-            sentiment_color = {"愤怒": "red", "焦虑": "orange", "平静": "blue"}
-
-            with st.expander(
-                f"{CATEGORY_RULES.get(row['分类结果'], {}).get('icon', '📌')} "
-                f"[{row['优先级']}] {row['客诉文本'][:60]}..."
-            ):
-                col_a, col_b = st.columns([2, 1])
-                with col_a:
-                    st.markdown(f"**客诉原文**")
-                    st.text(row["客诉文本"])
-                    st.markdown(f"**处理建议**")
-                    st.info(row["处理建议"])
-                with col_b:
-                    st.markdown(f"**分类**: {row['分类结果']}（置信度 {row['置信度']:.0%}）")
-                    st.markdown(f"**优先级**: :{priority_color.get(row['优先级'], 'green')}[{row['优先级']}]")
-                    st.markdown(f"**情绪**: :{sentiment_color.get(row['情绪'], 'blue')}[{row['情绪']}]")
-                    if "order_amount" in df.columns and pd.notna(row.get("order_amount")):
-                        st.markdown(f"**订单金额**: ¥{row['order_amount']}")
-
-    # ---- Tab2: 统计分析看板 ----
-    with tab2:
-        st.subheader("统计分析看板")
-
-        col_v1, col_v2 = st.columns(2)
-
-        with col_v1:
-            # 分类分布饼图
-            cat_counts = df["分类结果"].value_counts()
-            fig_pie = px.pie(
-                values=cat_counts.values,
-                names=cat_counts.index,
-                title="客诉分类分布",
-                color_discrete_sequence=px.colors.qualitative.Set2,
-                hole=0.4,
-            )
-            fig_pie.update_traces(textinfo="label+percent+value")
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with col_v2:
-            # 优先级分布柱状图
-            pri_counts = df["优先级"].value_counts()
-            color_map = {"P0-紧急": "#FF4444", "P1-重要": "#FFA726", "P2-普通": "#66BB6A"}
-            fig_bar = px.bar(
-                x=pri_counts.index,
-                y=pri_counts.values,
-                title="优先级分布",
-                color=pri_counts.index,
-                color_discrete_map=color_map,
-                labels={"x": "优先级", "y": "数量"},
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        col_v3, col_v4 = st.columns(2)
-
-        with col_v3:
-            # 情绪分布
-            sent_counts = df["情绪"].value_counts()
-            fig_sent = px.bar(
-                x=sent_counts.index,
-                y=sent_counts.values,
-                title="情绪分布",
-                color=sent_counts.index,
-                color_discrete_map={"愤怒": "#FF4444", "焦虑": "#FFA726", "平静": "#66BB6A"},
-            )
-            st.plotly_chart(fig_sent, use_container_width=True)
-
-        with col_v4:
-            # 分类×优先级交叉热力图
-            cross_tab = pd.crosstab(df["分类结果"], df["优先级"])
-            fig_heat = px.imshow(
-                cross_tab.values,
-                x=cross_tab.columns,
-                y=cross_tab.index,
-                title="分类×优先级交叉分析",
-                color_continuous_scale="Reds",
-                text_auto=True,
-            )
-            st.plotly_chart(fig_heat, use_container_width=True)
-
-        # 如果有时间字段，显示趋势
-        if "create_time" in df.columns:
-            st.subheader("时间趋势")
-            try:
-                df_trend = df.copy()
-                df_trend["create_time"] = pd.to_datetime(df_trend["create_time"])
-                df_trend["日期"] = df_trend["create_time"].dt.date
-                trend_data = df_trend.groupby(["日期", "分类结果"]).size().reset_index(name="数量")
-
-                fig_line = px.line(
-                    trend_data,
-                    x="日期",
-                    y="数量",
-                    color="分类结果",
-                    title="客诉分类日趋势",
-                    markers=True,
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
-            except Exception:
-                st.caption("时间字段格式无法解析，跳过趋势图")
-
-    # ---- Tab3: 批量异常检测 ----
-    with tab3:
-        st.subheader("🔍 批量异常检测")
-
-        anomalies = detect_batch_anomalies(df, min_count=anomaly_min_count)
-
-        if anomalies:
-            st.warning(f"⚠️ 检测到 **{len(anomalies)}** 个疑似批量异常")
-
-            for i, anomaly in enumerate(anomalies):
-                with st.expander(
-                    f"{anomaly['预警等级']} {anomaly['异常主题']} —— 影响 {anomaly['影响单量']} 单",
-                    expanded=(i == 0),
-                ):
-                    col_a1, col_a2 = st.columns(2)
-                    with col_a1:
-                        st.markdown(f"**异常主题**: {anomaly['异常主题']}")
-                        st.markdown(f"**关联关键词**: {anomaly['关联关键词']}")
-                        st.markdown(f"**影响单量**: {anomaly['影响单量']} 单")
-                    with col_a2:
-                        st.markdown("**建议响应动作**")
-                        st.info(
-                            f"1. 定位涉事商品/商家/物流商\n"
-                            f"2. 核实影响面，评估是否需要升级\n"
-                            f"3. 制定批量处理策略（自动拦截 or 人工兜底）\n"
-                            f"4. 输出标准话术模板，通知一线"
-                        )
+        if llm_a:
+            st.warning(f"AI 语义聚类检测到 **{len(llm_a)}** 个异常事件")
+            for a in llm_a:
+                sev = a.get("severity", "🟡 黄色预警")
+                with st.expander(f"{sev} {a.get('topic', '未命名')} — 约 {a.get('affected_count', '?')} 单", expanded=True):
+                    x1, x2 = st.columns(2)
+                    with x1:
+                        st.markdown(f"**描述**: {a.get('description', '')}")
+                        st.markdown(f"**关键词**: {'、'.join(a.get('keywords', []))}")
+                        st.markdown(f"**影响**: 约 {a.get('affected_count', '?')} 单")
+                    with x2:
+                        st.markdown("**建议动作**")
+                        st.info(a.get("recommended_action", "核实后制定应对策略"))
         else:
-            st.success("✅ 未检测到明显批量异常")
-
-        # 展示各分类下的热门关键词
-        st.subheader("各分类Top关键词")
-        for cat in df["分类结果"].unique():
-            if cat == "其他":
-                continue
-            cat_texts = df[df["分类结果"] == cat]["客诉文本"].tolist()
-            all_words = []
-            for t in cat_texts:
-                all_words.extend(extract_keywords(t))
-            word_counts = Counter(all_words).most_common(10)
-
-            if word_counts:
-                icon = CATEGORY_RULES.get(cat, {}).get("icon", "")
-                st.markdown(f"{icon} **{cat}**: {' | '.join([f'{w}({c})' for w, c in word_counts])}")
-
-    # ---- Tab4: 原始数据对比 ----
-    with tab4:
-        st.subheader("原始数据与分类结果对比")
-        display_cols = ["客诉文本", "分类结果", "置信度", "情绪", "优先级"]
-        available_cols = [c for c in display_cols if c in df.columns]
-        st.dataframe(df[available_cols], use_container_width=True, height=400)
+            st.success("AI 语义聚类未发现批量异常事件")
+    else:
+        st.info(f"💡 {config['name']} 未连接，输入 API Key 或启动 Ollama 后可体验 AI 异常检测")
 
 
 def show_export(df):
-    """导出功能"""
-    st.divider()
     st.subheader("📥 导出分析结果")
-
-    col_e1, col_e2 = st.columns([1, 3])
-    with col_e1:
-        csv_data = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button(
-            label="⬇️ 下载完整分析结果CSV",
-            data=csv_data,
-            file_name=f"客诉分类结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with col_e2:
-        st.caption(
-            f"导出文件包含 {len(df)} 条客诉的完整分析结果：分类、置信度、情绪、优先级、处理建议。可用于复盘分析、汇报材料或接入下游系统。"
-        )
+    e1, e2 = st.columns([1, 3])
+    with e1:
+        csv = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("⬇️ 下载完整分析结果 (CSV)", data=csv,
+                           file_name=f"客诉分类结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                           mime="text/csv", use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════
-# 示例数据生成
-# ═══════════════════════════════════════════════════════════
+def _render_engine_card(category, confidence, sentiment, priority, suggestion, extra=None):
+    """渲染单个引擎结果卡片"""
+    icon = CATEGORY_RULES.get(category, {}).get("icon", "📌")
+    pc = {"P0-紧急": "red", "P1-重要": "orange", "P2-普通": "green"}
+    sc = {"愤怒": "red", "焦虑": "orange", "平静": "blue"}
 
-def generate_sample_data():
-    """生成50条模拟客诉数据，包含正常客诉和埋点的批量异常"""
-    records = [
-        # ── 退款类（正常分散）──
-        ["C001", "我买了一件衣服，穿了一次就起球了，我要退款！", 189, "2026-05-01"],
-        ["C002", "在你们平台买了个耳机，用了两天就坏了，能退钱吗", 299, "2026-05-01"],
-        ["C003", "买的护肤品过敏了，脸都红了，要求退款赔偿", 399, "2026-05-02"],
-        ["C004", "手表买回来就不走针，明显是次品，退一赔三", 1299, "2026-05-02"],
-        ["C005", "鞋子码数不对，我要退货退款，你们客服一直不处理", 259, "2026-05-03"],
-        ["C006", "买的包包五金件掉色，质量太差了，要求退款", 459, "2026-05-04"],
-        ["C007", "电饭煲用了不到一个月就坏了，申请退款被拒，我要去12315投诉", 599, "2026-05-04"],
-        ["C008", "蓝牙音箱连不上手机，申请退货退款，已经寄回去了", 199, "2026-05-05"],
+    st.markdown(f"**{icon} 分类**: {category}（置信度 {confidence:.0%}）")
+    st.markdown(f"**优先级**: :{pc.get(priority, 'green')}[{priority}]")
+    st.markdown(f"**情绪**: :{sc.get(sentiment, 'blue')}[{sentiment}]")
+    if suggestion:
+        st.markdown(f"**处理建议**: {suggestion}")
+    if extra:
+        for label, value in extra.items():
+            if value:
+                st.caption(f"*{label}: {value}*")
 
-        # ── 物流类（正常分散）──
-        ["L001", "我买的商品已经发货了，但物流信息3天没更新了", 88, "2026-05-01"],
-        ["L002", "包裹显示已签收但我根本没收到，快递员电话打不通", 156, "2026-05-03"],
-        ["L003", "订单已经一周了还没有发货，催了好几次了", 320, "2026-05-05"],
-        ["L004", "快递把我包裹弄丢了，商家推卸责任让我自己找快递公司", 445, "2026-05-06"],
-        ["L005", "买的生鲜食品，快递慢了两天，到了都臭了", 128, "2026-05-07"],
-        ["L006", "海外购的货卡在海关快半个月了，到底什么时候能到", 899, "2026-05-08"],
-        ["L007", "我填错地址了，快递已经发出去了怎么办", 233, "2026-05-09"],
 
-        # ── 商品质量类（正常分散）──
-        ["Q001", "买的手机壳和图片完全不一样，颜色差很多", 39, "2026-05-02"],
-        ["Q002", "奶粉打开有一股怪味，怀疑是假货，不敢给孩子喝", 288, "2026-05-04"],
-        ["Q003", "买的窗帘布料和描述的厚度完全不符，太薄了", 176, "2026-05-06"],
-        ["Q004", "运动鞋鞋底开胶了，才穿了一个星期，这质量太差了", 399, "2026-05-08"],
-        ["Q005", "收到的衣服有明显色差，面料也和描述不一样", 219, "2026-05-10"],
+def generate_keyword_results(df):
+    """对 DataFrame 执行批量关键词分析"""
+    progress_bar = st.progress(0)
+    total = len(df)
+    categories, confidences, sentiments, priorities, suggestions = [], [], [], [], []
 
-        # ── 服务态度类（正常分散）──
-        ["S001", "客服态度极差，我说了半天她一点都不耐烦，直接挂断了", 99, "2026-05-03"],
-        ["S002", "我联系客服三次了，每次都是机器人回复，根本没人理我", 456, "2026-05-05"],
-        ["S003", "商家推诿责任，明明是质量问题非说是我自己弄坏的", 688, "2026-05-07"],
-        ["S004", "客服答应给我回电，等了两天都没有任何消息", 345, "2026-05-09"],
-        ["S005", "投诉客服经理后态度更差了，这种服务我要曝光到网上", 799, "2026-05-11"],
+    for i, (_, row) in enumerate(df.iterrows()):
+        text = row["客诉文本"]
+        cat, conf = keyword_classify(text)
+        sent = keyword_sentiment(text)
+        amount = None
+        if "order_amount" in df.columns:
+            try:
+                amount = float(row["order_amount"]) if pd.notna(row.get("order_amount")) else None
+            except (ValueError, TypeError):
+                amount = None
+        pri = keyword_priority(text, sent, amount)
+        sug = keyword_suggestion(cat, sent, pri)
 
-        # ── 其他类 ──
-        ["O001", "怎么修改收货地址？我已经下单了", 66, "2026-05-02"],
-        ["O002", "优惠券为什么用不了？显示不符合条件", 120, "2026-05-06"],
-        ["O003", "怎么联系商家？我想确认一下尺码再发货", 355, "2026-05-10"],
-        ["O004", "同城配送要多久？我明天就要用", 42, "2026-05-12"],
-        ["O005", "发票怎么开？我要电子发票", 89, "2026-05-13"],
-    ]
+        categories.append(cat)
+        confidences.append(conf)
+        sentiments.append(sent)
+        priorities.append(pri)
+        suggestions.append(sug)
+        progress_bar.progress((i + 1) / total)
 
-    # ── 🎯 埋点：批量异常1 - "银饰品材质不符"（模拟拼多多 silver jewelry case）──
-    batch1_dates = ["2026-05-15", "2026-05-15", "2026-05-15", "2026-05-16", "2026-05-16",
-                    "2026-05-16", "2026-05-16", "2026-05-17", "2026-05-17", "2026-05-17",
-                    "2026-05-17", "2026-05-17"]
-    batch1_texts = [
-        "买的银手镯说是999纯银，拿回来一测根本不是，含银量最多60%，这算不算欺诈",
-        "这个银项链掉色也太严重了吧，戴了两天脖子都绿了，根本不是纯银的",
-        "S925银戒指，结果戴了一周就发黑，我以前买的银饰戴一年都不会这样，肯定是假的",
-        "银耳钉收到就有铜锈味，这是银的吗？我要退货退款",
-        "买的银饰套盒，里面好几件都有氧化斑点，商家非说是正常现象，这不是忽悠人吗",
-        "这个银镯子上面明明写的S925，但检测出来是铜镀银，假冒伪劣！我要去315举报",
-        "银项链的材质跟详情页完全不符，证书也是假的，太坑人了",
-        "买了两对银耳环都掉色，而且掉色之后里面露出来的是红色的，这根本就是铜的",
-        "那个银饰商家太黑了，我买的银手镯材质完全不对，而且多个买家都反映有这个问题",
-        "又是银饰，又是材质不符，你们平台到底管不管这类商家，这已经是最近看到的第N个了",
-        "S925银饰套链，收到货根本不是银的，戴了一次就过敏起疹子，要求退款加赔偿",
-        "银饰手镯所谓的'纯银'承诺完全是虚假宣传，材质检测根本不过关，建议彻查该类商家",
-    ]
-
-    for i, (date, text) in enumerate(zip(batch1_dates, batch1_texts)):
-        records.append([f"B1-{i+1:02d}", text, round(200 + i * 50, -1), date])
-
-    # ── 🎯 埋点：批量异常2 - "台湾集运物流积压"（模拟拼多多 Taiwan logistics case）──
-    batch2_dates = ["2026-05-16", "2026-05-16", "2026-05-17", "2026-05-17", "2026-05-17",
-                    "2026-05-18", "2026-05-18", "2026-05-18"]
-    batch2_texts = [
-        "台湾集运的包裹已经等了一个月了还没到，物流显示一直在中转，到底什么时候能收到",
-        "集运包裹卡在中转站不动了，客服也联系不上，我的货到底在哪",
-        "台湾流向的物流是不是出了什么问题，我的集运订单已经有20多天没更新物流了",
-        "三个集运包裹全部积压，问了物流公司说是运力不够，你们平台有没有解决方案",
-        "集运台湾的订单物流已经超过30天，打了好多次电话都说在处理，到底能不能给个准信",
-        "我的集运包裹显示异常，问客服说是在协调，但是等了一周没任何进展",
-        "台湾集运商到底什么时候能恢复，我的订单各种节日礼物等着用呢",
-        "物流积压这么严重，你们平台至少应该主动通知消费者，而不是让我们自己发现",
-    ]
-
-    for i, (date, text) in enumerate(zip(batch2_dates, batch2_texts)):
-        records.append([f"B2-{i+1:02d}", text, round(300 + i * 80, -1), date])
-
-    # ── 剩余正常客诉补足到50条 ──
-    filler = [
-        ["F01", "买了一箱零食，有一包破了，其他的倒是好的", 68, "2026-05-11"],
-        ["F02", "订单显示发货但是我看不到物流信息", 145, "2026-05-12"],
-        ["F03", "收到了不是我买的东西，发错货了", 200, "2026-05-13"],
-        ["F04", "手机壳质量不错但是型号发错了", 45, "2026-05-14"],
-        ["F05", "客服挺好的帮我解决了问题，但是退款到账太慢了", 500, "2026-05-14"],
-        ["F06", "我想问问能不能无理由退货，衣服标签还在", 329, "2026-05-15"],
-        ["F07", "忘记用优惠券了能不能退差价", 178, "2026-05-18"],
-        ["F08", "同城快递为什么跑了三天，这效率也太低了", 56, "2026-05-18"],
-    ]
-    records.extend(filler)
-
-    df = pd.DataFrame(records, columns=["complaint_id", "complaint_text", "order_amount", "create_time"])
-    return df
+    progress_bar.empty()
+    return categories, confidences, sentiments, priorities, suggestions
 
 
 # ═══════════════════════════════════════════════════════════
-# 入口
+# 主入口
 # ═══════════════════════════════════════════════════════════
+
+def main():
+    init_session()
+
+    # 标题栏
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.title("🔍 客诉智能分类与处理建议系统")
+        st.caption("多模型 AI 引擎 | 关键词规则 + Ollama + DeepSeek + Gemini + Groq")
+    with c2:
+        st.metric("版本", "v3.1", delta="多模型切换")
+        ollama_ok = check_ollama_available() and check_ollama_model()
+        st.metric("本地 AI", "就绪" if ollama_ok else "待启动")
+
+    st.divider()
+
+    # 侧边栏
+    selected_model = show_sidebar()
+    config = MODELS[selected_model]
+    is_rule_only = (config["sdk_type"] == "rule")
+
+    # 主区域
+    if st.session_state.get("working_df") is None:
+        show_welcome()
+    else:
+        df = st.session_state["working_df"].copy()
+        if "客诉文本" not in df.columns and "complaint_text" in df.columns:
+            df["客诉文本"] = df["complaint_text"]
+
+        # 关键词引擎（始终运行）
+        with st.spinner("🔧 关键词规则引擎分析中..."):
+            kw_cats, kw_confs, kw_sents, kw_pris, kw_sugs = generate_keyword_results(df)
+            df["分类结果"] = kw_cats
+            df["置信度"] = kw_confs
+            df["情绪"] = kw_sents
+            df["优先级"] = kw_pris
+            df["处理建议"] = kw_sugs
+
+        # AI 引擎 — 仅非规则模式且客户端就绪时运行
+        client = None if is_rule_only else get_client(selected_model)
+
+        if is_rule_only:
+            st.success(f"🔧 使用**关键词规则引擎**完成分析，共 {len(df)} 条客诉。切换到 AI 引擎可获得语义级分析。")
+        elif client:
+            st.info(f"🤖 启动 {config['name']} 语义分析...（处理 80 条客诉约需 1-3 分钟）")
+
+            ai_cats, ai_confs, ai_sents, ai_pris, ai_sugs = [], [], [], [], []
+            ai_reasonings, ai_compounds = [], []
+
+            progress_bar = st.progress(0)
+            total = len(df)
+
+            for i, (_, row) in enumerate(df.iterrows()):
+                result = llm_classify(row["客诉文本"], selected_model, client)
+                if result:
+                    ai_cats.append(result.get("category", "其他"))
+                    ai_confs.append(result.get("confidence", 0.0))
+                    ai_sents.append(result.get("sentiment", "平静"))
+                    ai_pris.append(result.get("priority", "P2-普通"))
+                    ai_sugs.append(result.get("action_recommendation", ""))
+                    ai_reasonings.append(result.get("reasoning", ""))
+                    ai_compounds.append(result.get("is_compound", False))
+                else:
+                    ai_cats.append("其他"); ai_confs.append(0.0); ai_sents.append("平静")
+                    ai_pris.append("P2-普通"); ai_sugs.append(""); ai_reasonings.append("")
+                    ai_compounds.append(False)
+                progress_bar.progress((i + 1) / total)
+
+            progress_bar.empty()
+
+            df["AI分类结果"] = ai_cats
+            df["AI置信度"] = ai_confs
+            df["AI情绪"] = ai_sents
+            df["AI优先级"] = ai_pris
+            df["AI处理建议"] = ai_sugs
+            df["LLM分类理由"] = ai_reasonings
+            df["是否复合"] = ai_compounds
+
+            st.success(f"✅ {config['name']} 分析完成，共处理 {total} 条客诉")
+        else:
+            # AI 未就绪——不报错，展示规则结果并引导配置
+            if config["key_required"]:
+                st.info(f"💡 **{config['name']}** 需要 API Key 才能启用。当前展示的是**关键词规则引擎**结果。请在侧边栏输入 Key 或切换到「关键词规则引擎」模式。")
+            elif selected_model == "ollama-qwen":
+                ollama_running = check_ollama_available()
+                if not ollama_running:
+                    st.warning("⚠️ Ollama 未运行。当前展示**关键词规则引擎**结果。安装 Ollama 后可免费使用本地 AI。")
+                    st.code("下载 Ollama: https://ollama.com/download/windows\n安装后运行: ollama pull qwen2.5:3b", language="bash")
+                else:
+                    st.warning("⚠️ Qwen2.5 模型未拉取。当前展示**关键词规则引擎**结果。运行 `ollama pull qwen2.5:3b` 拉取模型后即可使用。")
+
+        # 展示结果
+        show_batch_analysis(df, selected_model, client if not is_rule_only else None)
+
 
 if __name__ == "__main__":
     main()
