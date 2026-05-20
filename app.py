@@ -1,5 +1,5 @@
 """
-客诉智能分类与处理建议系统 v3.1
+客诉智能分类系统 v3.2
 Complaint Intelligent Classification & Suggestion System
 
 独立作品 — 多模型 AI 引擎架构
@@ -598,6 +598,18 @@ def init_session():
 
 VERSION_HISTORY = [
     {
+        "version": "v3.2",
+        "date": "2026-05-20",
+        "title": "分析深度增强 — 双引擎对比报告 + 分歧案例 + 低置信告警",
+        "changes": [
+            "新增双引擎对比报告Tab：一致率统计、分类交叉矩阵、置信度分布直方图",
+            "新增分歧案例专题：自动筛选双引擎分类不一致的case并分析原因",
+            "新增低置信度告警：AI置信度<0.6的客诉高亮标记，提示人工审核",
+        ],
+        "advantage": "不仅做分类，更深入评估分类质量，展示模型评估和Badcase归因能力",
+        "icon": "📊",
+    },
+    {
         "version": "v3.1",
         "date": "2026-05-20",
         "title": "多模型 AI 引擎架构",
@@ -817,7 +829,7 @@ def show_issue_report():
 
 def show_welcome():
     st.markdown("""
-    ### 👋 客诉智能分类与处理建议系统 v3.1
+    ### 👋 客诉智能分类系统 v3.2
 
     **多模型 AI 引擎 Demo** — 本地 Ollama（免费）+ DeepSeek V4 + Gemini Flash（免费）+ Groq（免费）
 
@@ -1034,19 +1046,77 @@ def show_batch_analysis(df, model_key, client):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 分类结果明细", "📊 统计分析看板", "🔍 批量异常检测", "📥 导出"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📋 分类结果明细", "📊 对比报告", "📈 统计分析", "🔍 批量异常检测", "📥 导出"]
+    )
 
     with tab1:
         show_result_table(df)
 
     with tab2:
+        show_comparison_report(df)
+
+    with tab3_old:
         show_analytics(df)
 
-    with tab3:
+    with tab4:
         show_anomaly(df, model_key, client)
 
-    with tab4:
+    with tab5:
         show_export(df)
+
+
+def show_comparison_report(df):
+    """双引擎对比报告：一致率、分歧分析、置信度分布"""
+    st.subheader("双引擎对比分析报告")
+    has_ai = "AI分类结果" in df.columns
+    if not has_ai:
+        st.info("切换到 AI 引擎后可查看双引擎对比报告")
+        return
+    match_mask = df["分类结果"] == df["AI分类结果"]
+    match_rate = match_mask.sum() / len(df) * 100
+    divergent = df[~match_mask]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("双引擎一致率", f"{match_rate:.1f}%",
+                  delta="高一致" if match_rate >= 80 else "需关注" if match_rate >= 60 else "偏差大")
+    with c2:
+        st.metric("分歧案例", len(divergent), delta=f"{len(divergent)/len(df)*100:.0f}%")
+    with c3:
+        low_conf = (df["AI置信度"] < 0.6).sum() if "AI置信度" in df.columns else 0
+        st.metric("低置信度(<0.6)", low_conf, delta="模糊地带")
+    st.subheader("分类交叉矩阵（规则 vs AI）")
+    cross = pd.crosstab(df["分类结果"], df["AI分类结果"])
+    fig = px.imshow(cross.values, x=cross.columns, y=cross.index,
+                    title="规则引擎 vs AI 引擎分类对比", color_continuous_scale="Blues", text_auto=True)
+    st.plotly_chart(fig, use_container_width=True)
+    if "AI置信度" in df.columns:
+        st.subheader("AI 置信度分布")
+        fig_hist = px.histogram(df, x="AI置信度", nbins=10, title="AI 分类置信度分布",
+                                color_discrete_sequence=["#2196F3"])
+        fig_hist.add_vline(x=0.6, line_dash="dash", line_color="red", annotation_text="低置信阈值")
+        st.plotly_chart(fig_hist, use_container_width=True)
+    if len(divergent) > 0:
+        st.subheader(f"分歧案例专题（{len(divergent)} 条）")
+        for _, row in divergent.head(15).iterrows():
+            kw_cat = row["分类结果"]
+            ai_cat = row.get("AI分类结果", "?")
+            ai_reason = row.get("LLM分类理由", "")
+            ai_conf = row.get("AI置信度", 0)
+            text = str(row.get("客诉文本", ""))[:100]
+            icon = "🤖" if ai_conf >= 0.7 else "❓"
+            with st.expander(f"{icon} 规则={kw_cat} -> AI={ai_cat} | 置信度{ai_conf:.0%} | {text[:50]}..."):
+                st.markdown(f"**原文**: {text}")
+                st.markdown(f"**关键词**: {kw_cat}  |  **AI**: {ai_cat}（{ai_reason}）")
+                if ai_conf < 0.6:
+                    st.warning("AI 置信度低，建议人工审核")
+    if "AI置信度" in df.columns:
+        low_conf_df = df[df["AI置信度"] < 0.6]
+        if len(low_conf_df) > 0:
+            st.divider()
+            st.subheader(f"低置信度告警（{len(low_conf_df)} 条）")
+            for _, row in low_conf_df.head(10).iterrows():
+                st.markdown(f"- [{row.get('AI置信度', 0):.0%}] {row['分类结果']} | {str(row.get('客诉文本', ''))[:80]}...")
 
 
 def show_result_table(df):
@@ -1248,10 +1318,10 @@ def main():
     # 标题栏
     c1, c2 = st.columns([3, 1])
     with c1:
-        st.title("🔍 客诉智能分类与处理建议系统")
+        st.title("🔍 客诉智能分类系统")
         st.caption("多模型 AI 引擎 | 关键词规则 + Ollama + DeepSeek + Gemini + Groq")
     with c2:
-        st.metric("版本", "v3.1", delta="多模型切换")
+        st.metric("版本", "v3.2", delta="分析深度增强")
         ollama_ok = check_ollama_available() and check_ollama_model()
         st.metric("本地 AI", "就绪" if ollama_ok else "待启动")
 
