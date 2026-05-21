@@ -1056,7 +1056,7 @@ def show_batch_analysis(df, model_key, client):
     with tab2:
         show_comparison_report(df)
 
-    with tab3_old:
+    with tab3:
         show_analytics(df)
 
     with tab4:
