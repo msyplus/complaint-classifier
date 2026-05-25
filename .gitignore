@@ -1,8 +1,11 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
 .venv/
 venv/
+.streamlit/secrets.toml
 *.csv
 !sample_complaints.csv
+*.bat
 .gstack/

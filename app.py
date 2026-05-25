@@ -829,9 +829,11 @@ def show_issue_report():
 
 def show_welcome():
     st.markdown("""
-    ### 👋 客诉智能分类系统 v3.2
+    ### 👋 VOC 智能分类与优先级评估 v3.2
 
-    **多模型 AI 引擎 Demo** — 本地 Ollama（免费）+ DeepSeek V4 + Gemini Flash（免费）+ Groq（免费）
+    这个 Demo 模拟服务 AI 工作流的第一步：把一条客诉/VOC 文本转化为**类别、情绪、优先级、处理建议和批量异常信号**。
+
+    **默认无需 API Key**：关键词规则引擎可直接演示；接入本地 Ollama、DeepSeek、Gemini 或 Groq 后可切换为 AI 增强分析。
 
     ---
 
@@ -845,11 +847,11 @@ def show_welcome():
     | 处理建议 | 模板化固定话术 | 针对原文本的个性化建议 |
     | 异常检测 | 关键词频率聚类 | 语义级事件聚类 |
 
-    #### 🚀 快速体验
+    #### 🚀 面试演示路径
 
-    1. **推荐**：安装 [Ollama](https://ollama.com/download/windows) 并运行 `ollama pull qwen2.5:3b` → 完全免费本地 AI
-    2. 或者输入 Gemini / Groq 免费 API Key（免费注册即可）
-    3. 点击 **加载 80 条模拟客诉数据** 开始体验
+    1. 直接点击侧边栏 **加载 80 条模拟客诉数据**。
+    2. 先用默认规则引擎展示稳定结果。
+    3. 如有 API Key 或本地 Ollama，再切换 AI 引擎对比语义分析效果。
     """)
     st.info("👈 在侧边栏选择分析引擎 → 加载数据 → 查看分析结果")
 
@@ -971,8 +973,10 @@ def show_sidebar():
                     st.success(f"已加载 {len(df)} 条数据")
                 else:
                     st.error("未找到客诉文本列")
+                    st.info("请确认 CSV 至少包含以下任一列名：complaint_text、客诉文本、投诉内容、voc_text、content、text。")
             except Exception as e:
                 st.error(f"文件读取失败: {e}")
+                st.info("建议先使用右侧「加载 80 条模拟客诉数据」完成演示；上传文件请使用 UTF-8 CSV，并保留文本列。")
 
         st.divider()
 
