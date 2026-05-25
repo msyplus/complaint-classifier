@@ -114,10 +114,14 @@ def get_client(model_key):
         from openai import OpenAI
 
         if not config["key_required"]:
+            if not check_ollama_available() or not check_ollama_model(config["model_id"]):
+                return None
             # Ollama 本地模式 — 无需 key
             return OpenAI(
                 base_url=config["base_url"],
                 api_key="ollama",  # Ollama 不校验 key，但 OpenAI SDK 要求非空
+                timeout=20.0,
+                max_retries=0,
             )
         else:
             key = os.getenv(config["key_name"], "") or st.session_state.get(f"key_{model_key}", "")
@@ -140,6 +144,7 @@ def get_client(model_key):
     return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def check_ollama_available():
     """检测本地 Ollama 是否在运行"""
     import socket
@@ -153,11 +158,17 @@ def check_ollama_available():
         return False
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def check_ollama_model(model_id="qwen2.5:3b"):
     """检查 Ollama 是否已拉取指定模型"""
     try:
         from openai import OpenAI
-        client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+        client = OpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama",
+            timeout=2.0,
+            max_retries=0,
+        )
         models = client.models.list()
         available = [m.id for m in models]
         return model_id in available
@@ -582,7 +593,7 @@ def generate_sample_data():
 def init_session():
     defaults = {
         "working_df": None,
-        "selected_model": "ollama-qwen",
+        "selected_model": "rule-only",
         "key_deepseek": "",
         "key_gemini": "",
         "key_groq": "",
@@ -758,7 +769,7 @@ def show_rules_config():
 
         # 重置
         st.divider()
-        if st.button("🔄 恢复默认规则", use_container_width=True):
+        if st.button("🔄 恢复默认规则", width='stretch'):
             for cat, cfg in CATEGORY_RULES.items():
                 st.session_state.pop(f"rule_cat_{cat}", None)
             for sent, cfg in SENTIMENT_RULES.items():
@@ -809,7 +820,7 @@ def show_issue_report():
                 key="issue_urgency",
             )
 
-        if st.button("提交问题", key="issue_submit", type="primary", use_container_width=True):
+        if st.button("提交问题", key="issue_submit", type="primary", width='stretch'):
             if not issue_title.strip():
                 st.error("请填写问题标题")
             else:
@@ -983,13 +994,13 @@ def show_sidebar():
         # 示例数据
         st.subheader("📥 快速体验")
         btn_label = "🎲 加载 80 条模拟客诉数据"
-        if st.button(btn_label, type="primary", use_container_width=True):
+        if st.button(btn_label, type="primary", width='stretch'):
             with st.spinner("生成模拟数据..."):
                 st.session_state["working_df"] = generate_sample_data()
             st.rerun()
 
         if st.session_state.get("working_df") is not None:
-            if st.button("🗑️ 清除数据", use_container_width=True):
+            if st.button("🗑️ 清除数据", width='stretch'):
                 st.session_state["working_df"] = None
                 st.rerun()
 
@@ -1093,13 +1104,13 @@ def show_comparison_report(df):
     cross = pd.crosstab(df["分类结果"], df["AI分类结果"])
     fig = px.imshow(cross.values, x=cross.columns, y=cross.index,
                     title="规则引擎 vs AI 引擎分类对比", color_continuous_scale="Blues", text_auto=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     if "AI置信度" in df.columns:
         st.subheader("AI 置信度分布")
         fig_hist = px.histogram(df, x="AI置信度", nbins=10, title="AI 分类置信度分布",
                                 color_discrete_sequence=["#2196F3"])
         fig_hist.add_vline(x=0.6, line_dash="dash", line_color="red", annotation_text="低置信阈值")
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width='stretch')
     if len(divergent) > 0:
         st.subheader(f"分歧案例专题（{len(divergent)} 条）")
         for _, row in divergent.head(15).iterrows():
@@ -1177,25 +1188,25 @@ def show_analytics(df):
         fig = px.pie(values=cat_c.values, names=cat_c.index, title="客诉分类分布",
                      color_discrete_sequence=px.colors.qualitative.Set2, hole=0.4)
         fig.update_traces(textinfo="label+percent+value")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     with c2:
         pri_c = df["优先级"].value_counts()
         cmap = {"P0-紧急": "#FF4444", "P1-重要": "#FFA726", "P2-普通": "#66BB6A"}
         fig = px.bar(x=pri_c.index, y=pri_c.values, title="优先级分布",
                      color=pri_c.index, color_discrete_map=cmap, labels={"x": "优先级", "y": "数量"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     c3, c4 = st.columns(2)
     with c3:
         sent_c = df["情绪"].value_counts()
         fig = px.bar(x=sent_c.index, y=sent_c.values, title="情绪分布",
                      color=sent_c.index, color_discrete_map={"愤怒": "#FF4444", "焦虑": "#FFA726", "平静": "#66BB6A"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     with c4:
         cross = pd.crosstab(df["分类结果"], df["优先级"])
         fig = px.imshow(cross.values, x=cross.columns, y=cross.index,
                         title="分类×优先级交叉分析", color_continuous_scale="Reds", text_auto=True)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     if "create_time" in df.columns:
         st.subheader("时间趋势")
@@ -1205,7 +1216,7 @@ def show_analytics(df):
             dft["日期"] = dft["create_time"].dt.date
             td = dft.groupby(["日期", "分类结果"]).size().reset_index(name="数量")
             fig = px.line(td, x="日期", y="数量", color="分类结果", title="客诉日趋势", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         except Exception:
             st.caption("时间字段无法解析")
 
@@ -1262,7 +1273,7 @@ def show_export(df):
         csv = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button("⬇️ 下载完整分析结果 (CSV)", data=csv,
                            file_name=f"客诉分类结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                           mime="text/csv", use_container_width=True)
+                           mime="text/csv", width='stretch')
 
 
 def _render_engine_card(category, confidence, sentiment, priority, suggestion, extra=None):
